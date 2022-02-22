@@ -1,7 +1,6 @@
 from config import TOKEN_IDX
 import numpy as np
 
-
 # probability of applying substitution operation on tokens selected for augmentation
 alpha_sub = 0.40
 # probability of applying delete operation on tokens selected for augmentation

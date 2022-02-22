@@ -5,13 +5,16 @@ import numpy as np
 from torch.utils import data
 import torch.multiprocessing
 from tqdm import tqdm
-
+import wandb
+import datetime
 from argparser import parse_arguments
 from dataset import Dataset
+from focal_loss import FocalLoss
 from model import DeepPunctuation, DeepPunctuationCRF
 from config import *
 import augmentation
 
+wandb.init(project="Bn punctuation with AI4Bharat model" , job_type='training')
 torch.multiprocessing.set_sharing_strategy('file_system')   # https://github.com/pytorch/pytorch/issues/11201
 
 args = parse_arguments()
@@ -30,12 +33,14 @@ augmentation.alpha_sub = args.alpha_sub
 augmentation.alpha_del = args.alpha_del
 token_style = MODELS[args.pretrained_model][3]
 ar = args.augment_rate
+loss_type = args.loss_type
 sequence_len = args.sequence_length
 aug_type = args.augment_type
 
 # Datasets
 if args.language == 'english':
-    train_set = Dataset(os.path.join(args.data_path, 'en/train2012'), tokenizer=tokenizer, sequence_len=sequence_len,
+    train_set = Dataset(os.path.join(args.nvidia, 'en/train2012'), tokenizer=tokenizer, sequence_len=sequence_len,
+    
                         token_style=token_style, is_train=True, augment_rate=ar, augment_type=aug_type)
     val_set = Dataset(os.path.join(args.data_path, 'en/dev2012'), tokenizer=tokenizer, sequence_len=sequence_len,
                       token_style=token_style, is_train=False)
@@ -88,7 +93,7 @@ test_loaders = [torch.utils.data.DataLoader(x, **data_loader_params) for x in te
 
 # logs
 os.makedirs(args.save_path, exist_ok=True)
-model_save_path = os.path.join(args.save_path, 'weights.pt')
+model_save_path = os.path.join(args.save_path, f'{token_style}_weights_{datetime.datetime.now()}.pt')
 log_path = os.path.join(args.save_path, args.name + '_logs.txt')
 
 
@@ -99,7 +104,12 @@ if args.use_crf:
 else:
     deep_punctuation = DeepPunctuation(args.pretrained_model, freeze_bert=args.freeze_bert, lstm_dim=args.lstm_dim)
 deep_punctuation.to(device)
-criterion = nn.CrossEntropyLoss()
+if loss_type=='focal_loss':
+    print("Focal Loss is selected as loss criterion")
+    criterion = FocalLoss(gamma=2)
+else:
+    print("CrossEntropyLoss is selected as loss criterion")
+    criterion = nn.CrossEntropyLoss()
 optimizer = torch.optim.Adam(deep_punctuation.parameters(), lr=args.lr, weight_decay=args.decay)
 
 
@@ -193,7 +203,7 @@ def train():
     with open(log_path, 'a') as f:
         f.write(str(args)+'\n')
     best_val_acc = 0
-    for epoch in range(args.epoch):
+    for epoch in range(1,args.epoch+1):
         train_loss = 0.0
         train_iteration = 0
         correct = 0
@@ -231,12 +241,16 @@ def train():
 
         train_loss /= train_iteration
         log = 'epoch: {}, Train loss: {}, Train accuracy: {}'.format(epoch, train_loss, correct / total)
+        wandb.log({'Train acc': correct / total, 'epoch': epoch})
+        wandb.log({'Train loss': train_loss, 'epoch': epoch})
         with open(log_path, 'a') as f:
             f.write(log + '\n')
         print(log)
 
         val_acc, val_loss = validate(val_loader)
         log = 'epoch: {}, Val loss: {}, Val accuracy: {}'.format(epoch, val_loss, val_acc)
+        wandb.log({'Val acc': val_acc, 'epoch': epoch})
+        wandb.log({'Val loss': val_loss, 'epoch': epoch})
         with open(log_path, 'a') as f:
             f.write(log + '\n')
         print(log)
@@ -245,13 +259,17 @@ def train():
             torch.save(deep_punctuation.state_dict(), model_save_path)
 
     print('Best validation Acc:', best_val_acc)
+    wandb.run.summary["Best validation Acc"] = best_val_acc
     deep_punctuation.load_state_dict(torch.load(model_save_path))
     for loader in test_loaders:
         precision, recall, f1, accuracy, cm = test(loader)
+        print(loader)
         log = 'Precision: ' + str(precision) + '\n' + 'Recall: ' + str(recall) + '\n' + 'F1 score: ' + str(f1) + \
               '\n' + 'Accuracy:' + str(accuracy) + '\n' + 'Confusion Matrix' + str(cm) + '\n'
         print(log)
         with open(log_path, 'a') as f:
+
+
             f.write(log)
         log_text = ''
         for i in range(1, 5):
