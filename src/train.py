@@ -1,21 +1,23 @@
-import os
-import torch
-import torch.nn as nn
-import numpy as np
-from torch.utils import data
-import torch.multiprocessing
-from tqdm import tqdm
-import wandb
 import datetime
+import os
+
+import augmentation
+import numpy as np
+import torch
+import torch.multiprocessing
+import torch.nn as nn
+import wandb
 from argparser import parse_arguments
+from config import *
 from dataset import Dataset
 from focal_loss import FocalLoss
+from scl_loss import ce_scl_loss
 from model import DeepPunctuation, DeepPunctuationCRF
-from config import *
-import augmentation
+from torch.utils import data
+from tqdm import tqdm
 
-wandb.init(project="Bn punctuation with AI4Bharat model" , job_type='training')
-torch.multiprocessing.set_sharing_strategy('file_system')   # https://github.com/pytorch/pytorch/issues/11201
+wandb.init(project="Bn punctuation with AI4Bharat model", job_type='training')
+torch.multiprocessing.set_sharing_strategy('file_system')  # https://github.com/pytorch/pytorch/issues/11201
 
 args = parse_arguments()
 
@@ -91,11 +93,25 @@ train_loader = torch.utils.data.DataLoader(train_set, **data_loader_params)
 val_loader = torch.utils.data.DataLoader(val_set, **data_loader_params)
 test_loaders = [torch.utils.data.DataLoader(x, **data_loader_params) for x in test_set]
 
+
+def get_all_targets(*loaders):
+    flatten = lambda t: [item for sublist in t for item in sublist]
+    result = []
+    for loader in loaders:
+        valid_targets = [targets.numpy().tolist() for _, targets in loader]
+        valid_targets = flatten(flatten(valid_targets))
+        all_valid_target = np.asarray(valid_targets)
+        all_valid_target = all_valid_target[all_valid_target != -1]
+        result.append(all_valid_target)
+    return result
+
+
+train_targets, valid_targets = get_all_targets(train_loader, val_loader)
+
 # logs
 os.makedirs(args.save_path, exist_ok=True)
 model_save_path = os.path.join(args.save_path, f'{token_style}_weights_{datetime.datetime.now()}.pt')
 log_path = os.path.join(args.save_path, args.name + '_logs.txt')
-
 
 # Model
 device = torch.device('cuda' if (args.cuda and torch.cuda.is_available()) else 'cpu')
@@ -107,6 +123,11 @@ deep_punctuation.to(device)
 if loss_type=='focal_loss':
     print("Focal Loss is selected as loss criterion")
     criterion = FocalLoss(gamma=2)
+elif loss_type == 'scl_loss':
+    print("SCL loss is selected as loss criterion")
+    _, weights = np.unique(train_targets, return_counts=True)
+    weights = weights / weights.sum()
+    weights = torch.tensor(weights, device=device, dtype=torch.float)
 else:
     print("CrossEntropyLoss is selected as loss criterion")
     criterion = nn.CrossEntropyLoss()
@@ -221,7 +242,17 @@ def train():
                 y_predict = deep_punctuation(x, att)
                 y_predict = y_predict.view(-1, y_predict.shape[2])
                 y = y.view(-1)
-                loss = criterion(y_predict, y)
+                if loss == 'scl_loss':
+                    mask = (y != -1) + 0
+                    preds, h0 = deep_punctuation(x.to(device), mask.to(device), return_last_state=True)
+                    loss = ce_scl_loss(y_predict, y, h0,
+                                       lambda_value=0.1,
+                                       temperature=0.3,
+                                       pooling=False,
+                                       weight=weights,
+                                       device=device)
+                else:
+                    loss = criterion(y_predict, y)
                 y_predict = torch.argmax(y_predict, dim=1).view(-1)
 
                 correct += torch.sum(y_mask * (y_predict == y).long()).item()
